@@ -5,40 +5,100 @@ import {
   FORTNOX_API_BASE_URL,
   RATE_LIMIT_REQUESTS,
   RATE_LIMIT_WINDOW_MS,
+  MIN_REQUEST_SPACING_MS,
+  MAX_RETRY_ATTEMPTS,
+  RETRY_BASE_DELAY_MS,
+  RETRY_MAX_DELAY_MS,
   MAX_FETCH_ALL_RESULTS,
   MAX_FETCH_ALL_PAGES,
   FETCH_ALL_PAGE_SIZE,
   FETCH_ALL_DELAY_MS
 } from "../constants.js";
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 // Rate limiting state
 let requestTimestamps: number[] = [];
+// Serialization gate so concurrent callers queue through the limiter one at a time,
+// turning a parallel burst into an evenly paced stream.
+let rateLimitGate: Promise<void> = Promise.resolve();
 
 /**
  * Simple rate limiter for Fortnox API (25 requests per 5 seconds)
  */
 async function waitForRateLimit(): Promise<void> {
-  const now = Date.now();
+  // Serialize concurrent callers: each waits for the previous one to finish pacing
+  // before computing its own delay. Without this, N parallel requests all read the same
+  // window state and fire at once (the burst that triggers Fortnox 429s).
+  const prior = rateLimitGate;
+  let release!: () => void;
+  rateLimitGate = new Promise<void>((resolve) => { release = resolve; });
+  await prior;
 
-  // Remove timestamps outside the window
-  requestTimestamps = requestTimestamps.filter(
-    (ts) => now - ts < RATE_LIMIT_WINDOW_MS
-  );
+  try {
+    let now = Date.now();
 
-  // If at limit, wait for oldest request to expire
-  if (requestTimestamps.length >= RATE_LIMIT_REQUESTS) {
-    const oldestTimestamp = requestTimestamps[0];
-    const waitTime = RATE_LIMIT_WINDOW_MS - (now - oldestTimestamp) + 50; // +50ms buffer
-    if (waitTime > 0) {
-      await new Promise((resolve) => setTimeout(resolve, waitTime));
-    }
-    // Clean up again after waiting
+    // Remove timestamps outside the sliding window
     requestTimestamps = requestTimestamps.filter(
-      (ts) => Date.now() - ts < RATE_LIMIT_WINDOW_MS
+      (ts) => now - ts < RATE_LIMIT_WINDOW_MS
     );
-  }
 
-  requestTimestamps.push(Date.now());
+    // Sliding-window cap: if at limit, wait for the oldest request to expire
+    if (requestTimestamps.length >= RATE_LIMIT_REQUESTS) {
+      const oldestTimestamp = requestTimestamps[0];
+      const waitTime = RATE_LIMIT_WINDOW_MS - (now - oldestTimestamp) + 50; // +50ms buffer
+      if (waitTime > 0) {
+        await sleep(waitTime);
+      }
+      now = Date.now();
+      requestTimestamps = requestTimestamps.filter(
+        (ts) => now - ts < RATE_LIMIT_WINDOW_MS
+      );
+    }
+
+    // Minimum spacing between request starts: smooths the allowed burst into a steady
+    // stream so we don't trip Fortnox's per-second enforcement.
+    const lastTimestamp = requestTimestamps[requestTimestamps.length - 1];
+    if (lastTimestamp !== undefined) {
+      const sinceLast = Date.now() - lastTimestamp;
+      if (sinceLast < MIN_REQUEST_SPACING_MS) {
+        await sleep(MIN_REQUEST_SPACING_MS - sinceLast);
+      }
+    }
+
+    requestTimestamps.push(Date.now());
+  } finally {
+    // Let the next queued caller proceed.
+    release();
+  }
+}
+
+/** Status codes worth retrying: rate limiting and transient server errors. */
+function isRetryableStatus(status: number | undefined): boolean {
+  return status === 429 || status === 500 || status === 502 || status === 503;
+}
+
+/**
+ * How long to wait before the next retry. Honors a Retry-After header (seconds or HTTP
+ * date) when Fortnox sends one; otherwise exponential backoff with jitter, capped.
+ */
+function computeRetryDelayMs(error: unknown, attempt: number): number {
+  const header = axios.isAxiosError(error)
+    ? error.response?.headers?.["retry-after"]
+    : undefined;
+  if (header !== undefined) {
+    const asSeconds = Number(header);
+    if (!Number.isNaN(asSeconds)) {
+      return Math.min(asSeconds * 1000, RETRY_MAX_DELAY_MS);
+    }
+    const asDate = Date.parse(String(header));
+    if (!Number.isNaN(asDate)) {
+      return Math.min(Math.max(asDate - Date.now(), 0), RETRY_MAX_DELAY_MS);
+    }
+  }
+  const backoff = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS);
+  const jitter = backoff * 0.25 * (((attempt * 2654435761) % 1000) / 1000); // deterministic jitter
+  return backoff + jitter;
 }
 
 /**
@@ -51,8 +111,6 @@ export async function fortnoxRequest<T>(
   data?: unknown,
   params?: Record<string, string | number | boolean | undefined>
 ): Promise<T> {
-  await waitForRateLimit();
-
   // Get access token using the token provider
   // In local mode, userId is undefined and ignored
   // In remote mode, userId comes from the request context
@@ -83,11 +141,23 @@ export async function fortnoxRequest<T>(
     data
   };
 
-  try {
-    const response = await axios(config);
-    return response.data;
-  } catch (error) {
-    throw handleApiError(error, endpoint);
+  // Retry loop: transient failures (429 / 5xx) back off and retry instead of being
+  // surfaced as a hard error that silently drops the caller's data.
+  let attempt = 0;
+  for (;;) {
+    await waitForRateLimit();
+    try {
+      const response = await axios(config);
+      return response.data;
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (isRetryableStatus(status) && attempt < MAX_RETRY_ATTEMPTS) {
+        await sleep(computeRetryDelayMs(error, attempt));
+        attempt++;
+        continue;
+      }
+      throw handleApiError(error, endpoint);
+    }
   }
 }
 

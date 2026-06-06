@@ -526,7 +526,13 @@ Examples:
           (r) => r.MetaInformation?.["@TotalResources"] || 0
         );
 
-        let invoices = result.items;
+        // Fortnox returns supplier-invoice Balance and Total as strings. Coerce to
+        // numbers up front so all sums add numerically instead of concatenating.
+        let invoices = result.items.map(inv => ({
+          ...inv,
+          Balance: Number(inv.Balance) || 0,
+          Total: Number(inv.Total) || 0
+        }));
 
         // Apply min_amount filter
         if (params.min_amount !== undefined) {
