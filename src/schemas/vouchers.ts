@@ -188,16 +188,17 @@ export const AccountActivitySchema = z.object({
   max_vouchers: z.number()
     .int()
     .min(10)
-    .max(500)
+    .max(2000)
     .default(500)
-    .describe("Maximum vouchers to scan (10-500). Use date filtering for larger datasets."),
+    .describe("Maximum vouchers to scan (10-2000, default 500). Each voucher requires a separate detail fetch, so large values are slow — prefer narrowing the date range (e.g. one month at a time) for big financial years. If the cap is reached the scan is truncated and summary totals are INCOMPLETE."),
   response_format: z.nativeEnum(ResponseFormat)
     .default(ResponseFormat.MARKDOWN)
     .describe("Output format: 'markdown' or 'json'")
-}).strict().refine(
-  (data) => data.account_number !== undefined || data.account_numbers !== undefined || data.account_range !== undefined,
-  { message: "Must specify at least one of: account_number, account_numbers, or account_range" }
-);
+}).strict();
+// NOTE: The "at least one of account_number/account_numbers/account_range" rule is
+// enforced in the tool handler, NOT via .refine() here. A .refine() wraps the schema
+// in a ZodEffects, which has no `.shape` — so the MCP SDK publishes an EMPTY input
+// schema, clients then send all args as strings, and parsing rejects every call.
 
 export type AccountActivityInput = z.infer<typeof AccountActivitySchema>;
 
@@ -237,9 +238,9 @@ export const SearchVouchersSchema = z.object({
   max_vouchers: z.number()
     .int()
     .min(10)
-    .max(500)
+    .max(2000)
     .default(500)
-    .describe("Maximum vouchers to scan (10-500). Use date filtering for larger datasets."),
+    .describe("Maximum vouchers to scan (10-2000, default 500). Each voucher requires a separate detail fetch, so large values are slow — prefer narrowing the date range (e.g. one month at a time) for big financial years. If the cap is reached the scan is truncated and summary totals are INCOMPLETE."),
   response_format: z.nativeEnum(ResponseFormat)
     .default(ResponseFormat.MARKDOWN)
     .describe("Output format: 'markdown' or 'json'")

@@ -488,6 +488,22 @@ Examples:
     },
     async (params: AccountActivityInput) => {
       try {
+        // Enforce the account-filter requirement here (kept out of the Zod schema as a
+        // .refine() so the published MCP input schema stays a plain object — see schema note).
+        if (
+          params.account_number === undefined &&
+          params.account_numbers === undefined &&
+          params.account_range === undefined
+        ) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: "Error: Must specify at least one of: account_number, account_numbers, or account_range."
+            }],
+            isError: true
+          };
+        }
+
         // Build account filter set
         const accountFilter = new Set<number>();
         if (params.account_number !== undefined) {
@@ -564,6 +580,12 @@ Examples:
 
         const accountSummary = new Map<number, { debit: number; credit: number; count: number }>();
 
+        // Track voucher-detail fetches that failed (e.g. Fortnox rate limiting). These
+        // are skipped, which silently drops their rows — so we count them and treat any
+        // failure as an incomplete result below, rather than reporting partial totals as
+        // if they were complete.
+        let failedDetailFetches = 0;
+
         // Process vouchers in batches of 10
         const batchSize = 10;
         for (let i = 0; i < voucherList.length; i += batchSize) {
@@ -579,6 +601,7 @@ Examples:
               const detail = await fortnoxRequest<VoucherResponse>(detailEndpoint, "GET", undefined, detailParams);
               return detail.Voucher;
             } catch {
+              failedDetailFetches++;
               return null;
             }
           });
@@ -639,6 +662,31 @@ Examples:
               .sort((a, b) => a.account - b.account)
           : undefined;
 
+        // Loud incompleteness signal. Totals can be PARTIAL for two distinct reasons:
+        //  (1) the voucher LIST was truncated at the scan cap, or
+        //  (2) individual voucher DETAIL fetches failed (e.g. rate limiting) and were skipped.
+        // Either one makes the summary unreliable, so surface both — and a big year can have
+        // thousands of vouchers while the matching accounts sit in the unscanned tail,
+        // producing a misleading "0 matches".
+        const incompleteReasons: string[] = [];
+        if (result.truncated) {
+          incompleteReasons.push(
+            `scanned only ${voucherList.length} of ${totalVouchers} vouchers (max_vouchers=${params.max_vouchers})` +
+            (matchingTransactions.length === 0
+              ? "; 0 matches most likely means the matching accounts are among the unscanned vouchers, NOT that there was no activity"
+              : "")
+          );
+        }
+        if (failedDetailFetches > 0) {
+          incompleteReasons.push(
+            `${failedDetailFetches} voucher detail fetch(es) failed and were skipped (often Fortnox rate limiting — avoid running account scans in parallel, then retry)`
+          );
+        }
+        const summaryComplete = !result.truncated && failedDetailFetches === 0;
+        const truncationWarning = incompleteReasons.length > 0
+          ? `INCOMPLETE RESULTS: ${incompleteReasons.join("; ")}. Summary totals are PARTIAL. For complete figures, narrow the date range (e.g. one month at a time)${result.truncated ? " or raise max_vouchers" : ""} and retry.`
+          : undefined;
+
         const output: Record<string, unknown> = {
           filter: {
             accounts: Array.from(accountFilter),
@@ -651,6 +699,9 @@ Examples:
           total_vouchers_available: totalVouchers,
           truncated: result.truncated,
           truncation_reason: result.truncationReason,
+          failed_detail_fetches: failedDetailFetches,
+          summary_complete: summaryComplete,
+          warning: truncationWarning,
           matching_transactions: matchingTransactions.length,
           summary: summaryArray,
           transactions: matchingTransactions
@@ -678,9 +729,9 @@ Examples:
           lines.push(`**Financial Year**: ${params.financial_year}`);
           lines.push(`**Vouchers Scanned**: ${voucherList.length} | **Matching Transactions**: ${matchingTransactions.length}`);
 
-          if (result.truncated) {
+          if (truncationWarning) {
             lines.push("");
-            lines.push(`⚠️ **Note**: ${result.truncationReason}`);
+            lines.push(`> ⚠️ **${truncationWarning}**`);
           }
 
           if (summaryArray && summaryArray.length > 0) {
@@ -718,7 +769,9 @@ Examples:
             }
           } else {
             lines.push("");
-            lines.push("*No transactions found matching the account criteria.*");
+            lines.push((result.truncated || failedDetailFetches > 0)
+              ? "*No matches among the successfully scanned vouchers — but the scan was incomplete (truncated and/or some detail fetches failed), so matching transactions may exist. Narrow the date range and retry before concluding there was no activity.*"
+              : "*No transactions found matching the account criteria.*");
           }
 
           textContent = lines.join("\n");

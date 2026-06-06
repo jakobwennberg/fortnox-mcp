@@ -20,6 +20,16 @@ export const MAX_FETCH_ALL_PAGES = 100;
 export const FETCH_ALL_PAGE_SIZE = 100;
 export const FETCH_ALL_DELAY_MS = 250; // Stay under 25 req/5sec rate limit
 
+// Minimum spacing between request *starts* so concurrent callers become a steady
+// stream instead of an instant burst (25 req / 5 s = 200ms; small buffer added).
+export const MIN_REQUEST_SPACING_MS = 210;
+
+// Transient-failure retry (HTTP 429 and 5xx). Backoff honors Retry-After when present,
+// otherwise exponential: RETRY_BASE_DELAY_MS * 2^attempt, capped at RETRY_MAX_DELAY_MS.
+export const MAX_RETRY_ATTEMPTS = 5;
+export const RETRY_BASE_DELAY_MS = 1000;
+export const RETRY_MAX_DELAY_MS = 8000;
+
 // Response format enum
 export enum ResponseFormat {
   MARKDOWN = "markdown",

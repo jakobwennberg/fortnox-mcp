@@ -279,7 +279,12 @@ export function registerBIAnalyticsTools(server: McpServer): void {
         };
 
         const receivables = receivablesResult.items.filter(inv => filterByDueDate(inv.DueDate));
-        const payables = payablesResult.items.filter(inv => filterByDueDate(inv.DueDate));
+        // Fortnox returns supplier-invoice Balance as a string (unlike customer
+        // invoices, which return a number). Coerce here so all downstream sums add
+        // numerically instead of concatenating strings.
+        const payables = payablesResult.items
+          .filter(inv => filterByDueDate(inv.DueDate))
+          .map(inv => ({ ...inv, Balance: Number(inv.Balance) || 0 }));
 
         // Generate time buckets
         const buckets = generateTimeBucketKeys(today, futureDate, params.group_by);
